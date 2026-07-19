@@ -4,12 +4,21 @@ Judgy Reachy No Phone - Get off your phone! 📱🤖
 A Reachy Mini app that detects when you pick up your phone
 and shames you with snarky comments.
 """
-
+import os
+import sys
 import time
 import threading
 import logging
 import asyncio
 import base64
+import os
+
+if __package__ is None and __spec__ is None:
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(package_dir)
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    __package__ = os.path.basename(package_dir)
 
 import cv2
 
