@@ -11,7 +11,7 @@ import threading
 import logging
 import asyncio
 import base64
-import os
+from collections import deque
 
 if __package__ is None and __spec__ is None:
     package_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,13 +21,16 @@ if __package__ is None and __spec__ is None:
     __package__ = os.path.basename(package_dir)
 
 import cv2
+from dotenv import load_dotenv
 
 from reachy_mini import ReachyMini, ReachyMiniApp
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
 
 from .config import Config, PERSONALITIES
 from .detection import PhoneDetector
 from .audio import LLMResponder, TextToSpeech
+from .face_tracking import FaceTracker
 from .animations import (
     play_sound_safe,
     get_animation_for_count,
@@ -38,6 +41,8 @@ from .animations import (
 from reachy_mini.motion.recorded_move import RecordedMoves
 
 logger = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
 
 class JudgyReachyNoPhone(ReachyMiniApp):
@@ -65,8 +70,11 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         self.llm = LLMResponder(api_key=self.config.GROQ_API_KEY, personality="pure_reachy")
         # Don't pass config voice defaults - let personalities use their own defaults
         self.tts = TextToSpeech(
-            elevenlabs_key=self.config.ELEVENLABS_API_KEY,
             personality="pure_reachy"
+        )
+        self.face_tracker = FaceTracker(
+            enabled=self.config.FACE_TRACKING_ENABLED,
+            confidence=self.config.FACE_TRACKING_CONFIDENCE,
         )
         # Load Reachy's emotion library for Pure Reachy mode
         try:
@@ -94,9 +102,32 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         # Camera thread state
         self.latest_frame = None
         self.latest_frame_jpeg = None  # JPEG encoded frame for web display
+        self.latest_frame_at = 0.0
         self.camera_running = False
         self.camera_fps = 0
-        self.detection_event_queue = []
+        self.detection_event_queue = deque(maxlen=16)
+        self._frame_condition = threading.Condition()
+
+        # This endpoint must exist before model loading callbacks or browser requests.
+        @self.settings_app.get("/api/personalities")
+        def get_personalities():
+            personalities_list = []
+            for key, data in PERSONALITIES.items():
+                eleven_voice_data = data.get(
+                    "default_eleven_voices", data.get("default_eleven_voice", "")
+                )
+                default_eleven = (
+                    eleven_voice_data[0] if isinstance(eleven_voice_data, list)
+                    and eleven_voice_data else eleven_voice_data
+                )
+                personalities_list.append({
+                    "id": key,
+                    "name": data["name"],
+                    "voice": data["voice"],
+                    "default_voice": data.get("default_voice", ""),
+                    "default_eleven_voice": default_eleven or "",
+                })
+            return {"personalities": personalities_list}
 
     def _on_model_loading(self, status: str, message: str):
         """Callback for model loading progress (like demo.js)."""
@@ -104,34 +135,10 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         self.model_loading_message = message
         logger.info(f"Model loading: {status} - {message}")
 
-        # Register API endpoint for personalities (must be before server starts)
-        @self.settings_app.get("/api/personalities")
-        def get_personalities():
-            """Return list of available personalities from config."""
-            personalities_list = []
-            for key, data in PERSONALITIES.items():
-                # Handle both old (single voice) and new (voice list) format
-                eleven_voice_data = data.get("default_eleven_voices", data.get("default_eleven_voice", ""))
-                if isinstance(eleven_voice_data, list):
-                    # Show first voice in list as the default
-                    default_eleven = eleven_voice_data[0] if eleven_voice_data else ""
-                else:
-                    default_eleven = eleven_voice_data
-
-                personalities_list.append({
-                    "id": key,
-                    "name": data["name"],
-                    "voice": data["voice"],
-                    "default_voice": data.get("default_voice", ""),
-                    "default_eleven_voice": default_eleven
-                })
-            return {"personalities": personalities_list}
-
     def _camera_thread(self, webcam, stop_event: threading.Event):
         """Fast camera capture and encoding thread (for laptop webcam in simulation)."""
         fps_counter = 0
         fps_start = time.time()
-        detection_skip = 0
 
         logger.info("Laptop camera thread started (simulation mode)")
 
@@ -142,9 +149,6 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                     time.sleep(0.01)
                     continue
 
-                # Store frame for detection
-                self.latest_frame = frame.copy()
-
                 # Calculate FPS
                 fps_counter += 1
                 if time.time() - fps_start >= 1.0:
@@ -152,31 +156,11 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                     fps_counter = 0
                     fps_start = time.time()
 
-                # Run detection every 3rd frame
-                if self.is_monitoring and (detection_skip % 3 == 0):
-                    try:
-                        event = self.detector.process_frame(
-                            frame,
-                            pickup_threshold=self.config.PICKUP_THRESHOLD,
-                            putdown_threshold=self.config.PUTDOWN_THRESHOLD,
-                            cooldown=self.config.COOLDOWN_SECONDS
-                        )
-                        # Store event for main thread to handle
-                        if event:
-                            self.detection_event_queue.append(event)
-                    except Exception as e:
-                        logger.error(f"Detection error: {e}")
-
-                detection_skip += 1
-
-                # Draw detection boxes only (no text overlays)
+                self.face_tracker.process(frame)
+                # Draw local phone and face detections for the web display.
                 frame_with_boxes = self.detector.draw_detections(frame)
-
-                # Encode as JPEG for web display
-                _, buffer = cv2.imencode('.jpg', frame_with_boxes, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                self.latest_frame_jpeg = base64.b64encode(buffer).decode('utf-8')
-
-                time.sleep(0.01)  # ~100 FPS max
+                frame_with_boxes = self.face_tracker.draw(frame_with_boxes)
+                self._publish_frame(frame, frame_with_boxes)
 
         finally:
             logger.info("Laptop camera thread stopped")
@@ -185,19 +169,23 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         """Camera thread using robot's media system (for real robot)."""
         fps_counter = 0
         fps_start = time.time()
-        detection_skip = 0
-
         logger.info("Robot camera thread started")
 
         try:
             while not stop_event.is_set() and self.camera_running:
-                frame = reachy_mini.media.get_frame()
-                if frame is None:
-                    time.sleep(0.01)
+                try:
+                    frame = reachy_mini.media.get_frame()
+                except Exception as exc:
+                    self.camera_loading_status = "connecting"
+                    self.camera_loading_message = f"Waiting for robot camera: {exc}"
+                    logger.warning("Robot camera read failed: %s", exc)
+                    time.sleep(0.25)
                     continue
-
-                # Store frame for detection
-                self.latest_frame = frame.copy()
+                if frame is None:
+                    self.camera_loading_status = "connecting"
+                    self.camera_loading_message = "Waiting for the first robot camera frame..."
+                    time.sleep(0.02)
+                    continue
 
                 # Calculate FPS
                 fps_counter += 1
@@ -206,49 +194,73 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                     fps_counter = 0
                     fps_start = time.time()
 
-                # Run detection every 3rd frame
-                if self.is_monitoring and (detection_skip % 3 == 0):
-                    try:
-                        event = self.detector.process_frame(
-                            frame,
-                            pickup_threshold=self.config.PICKUP_THRESHOLD,
-                            putdown_threshold=self.config.PUTDOWN_THRESHOLD,
-                            cooldown=self.config.COOLDOWN_SECONDS
-                        )
-                        # Store event for main thread to handle
-                        if event:
-                            self.detection_event_queue.append(event)
-                    except Exception as e:
-                        logger.error(f"Detection error: {e}")
-
-                detection_skip += 1
-
-                # Draw detection boxes only (no text overlays)
+                self.face_tracker.process(frame)
+                # Draw local phone and face detections for the web display.
                 frame_with_boxes = self.detector.draw_detections(frame)
-
-                # Encode as JPEG for web display
-                _, buffer = cv2.imencode('.jpg', frame_with_boxes, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                self.latest_frame_jpeg = base64.b64encode(buffer).decode('utf-8')
-
-                time.sleep(0.01)  # ~100 FPS max
+                frame_with_boxes = self.face_tracker.draw(frame_with_boxes)
+                self._publish_frame(frame, frame_with_boxes)
 
         finally:
             logger.info("Robot camera thread stopped")
 
+    def _publish_frame(self, frame, display_frame):
+        """Publish the newest frame without letting slow clients block capture."""
+        encoded, buffer = cv2.imencode(
+            ".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
+        )
+        if not encoded:
+            return
+        with self._frame_condition:
+            self.latest_frame = frame.copy()
+            self.latest_frame_jpeg = buffer.tobytes()
+            self.latest_frame_at = time.monotonic()
+            self.camera_loading_status = "ready"
+            self.camera_loading_message = "Camera streaming"
+            self._frame_condition.notify_all()
+
+    def _detection_thread(self, stop_event: threading.Event):
+        """Run expensive inference independently so it cannot freeze video capture."""
+        last_frame_at = 0.0
+        while not stop_event.is_set() and self.camera_running:
+            if not self.is_monitoring or self.model_loading_status != "ready":
+                stop_event.wait(0.1)
+                continue
+            with self._frame_condition:
+                self._frame_condition.wait_for(
+                    lambda: self.latest_frame_at > last_frame_at or stop_event.is_set(),
+                    timeout=0.5,
+                )
+                if stop_event.is_set() or self.latest_frame is None:
+                    continue
+                frame = self.latest_frame.copy()
+                last_frame_at = self.latest_frame_at
+            try:
+                event = self.detector.process_frame(
+                    frame,
+                    pickup_threshold=self.config.PICKUP_THRESHOLD,
+                    putdown_threshold=self.config.PUTDOWN_THRESHOLD,
+                    cooldown=self.config.COOLDOWN_SECONDS,
+                )
+                if event:
+                    self.detection_event_queue.append(event)
+            except Exception as exc:
+                logger.error("Detection error: %s", exc)
+
     def run(self, reachy_mini: ReachyMini, stop_event: threading.Event):
         """Main loop."""
 
-        # Start UI
-        ui_thread = threading.Thread(
-            target=self._run_ui,
-            args=(reachy_mini, stop_event),
-            daemon=True
-        )
-        ui_thread.start()
+        # Register all routes before lengthy model/camera initialization begins.
+        self._run_ui(reachy_mini, stop_event)
 
-        # Initialize detector (reports loading progress)
-        logger.info("Initializing YOLO model...")
-        self.detector.initialize()
+        # Model loading/downloads can take minutes on first run. Keep camera startup
+        # independent so users get live video immediately.
+        logger.info("Initializing YOLO model in the background...")
+        model_thread = threading.Thread(
+            target=self.detector.initialize,
+            name="phone-detector-loader",
+            daemon=True,
+        )
+        model_thread.start()
 
         # Auto-detect: Use laptop webcam in simulation, robot camera otherwise
         is_simulation = reachy_mini.client.get_status().simulation_enabled
@@ -267,8 +279,8 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                 webcam = None
             else:
                 logger.info("Laptop webcam opened successfully!")
-                self.camera_loading_status = "ready"
-                self.camera_loading_message = "Camera connected"
+                self.camera_loading_status = "connecting"
+                self.camera_loading_message = "Waiting for the first camera frame..."
                 self.camera_running = True
 
                 # Start fast camera thread
@@ -284,9 +296,6 @@ class JudgyReachyNoPhone(ReachyMiniApp):
             self.camera_loading_message = "Connecting to robot camera..."
 
             self.camera_running = True
-            self.camera_loading_status = "ready"
-            self.camera_loading_message = "Camera connected"
-
             # Start camera thread with robot's media system
             camera_thread = threading.Thread(
                 target=self._robot_camera_thread,
@@ -294,6 +303,14 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                 daemon=True
             )
             camera_thread.start()
+
+        if self.camera_running:
+            detection_thread = threading.Thread(
+                target=self._detection_thread,
+                args=(stop_event,),
+                daemon=True,
+            )
+            detection_thread.start()
 
         # Detection and robot control loop (separate from camera display)
         breath_counter = 0
@@ -308,7 +325,7 @@ class JudgyReachyNoPhone(ReachyMiniApp):
 
                 # Process detection events from camera thread
                 while self.detection_event_queue:
-                    event = self.detection_event_queue.pop(0)
+                    event = self.detection_event_queue.popleft()
                     try:
                         if event == "picked_up":
                             self._handle_phone_pickup(reachy_mini)
@@ -318,6 +335,8 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                         logger.error(f"Event handling error: {e}")
 
                 # Idle breathing when not reacting - only if no pending events
+                if not self.detection_event_queue:
+                    self.face_tracker.follow(reachy_mini)
                 breath_counter += delta
                 if breath_counter >= BREATH_INTERVAL:
                     breath_counter = 0
@@ -448,14 +467,23 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         # API endpoint: Get loading status (like demo.js)
         @self.settings_app.get("/api/loading-status")
         def get_loading_status():
+            camera_status = self.camera_loading_status
+            camera_message = self.camera_loading_message
+            if (
+                camera_status == "ready"
+                and self.latest_frame_at
+                and time.monotonic() - self.latest_frame_at > 3.0
+            ):
+                camera_status = "connecting"
+                camera_message = "Camera stream stalled; reconnecting..."
             return {
                 "model_status": self.model_loading_status,
                 "model_message": self.model_loading_message,
-                "camera_status": self.camera_loading_status,
-                "camera_message": self.camera_loading_message,
+                "camera_status": camera_status,
+                "camera_message": camera_message,
                 "overall_ready": (
                     self.model_loading_status == "ready" and
-                    self.camera_loading_status == "ready"
+                    camera_status == "ready"
                 )
             }
 
@@ -463,8 +491,43 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         @self.settings_app.get("/api/video-frame")
         def get_video_frame():
             if self.latest_frame_jpeg:
-                return {"frame": self.latest_frame_jpeg, "fps": self.camera_fps}
+                return {
+                    "frame": base64.b64encode(self.latest_frame_jpeg).decode("ascii"),
+                    "fps": self.camera_fps,
+                }
             return {"frame": None, "fps": 0}
+
+        @self.settings_app.get("/api/video-stream")
+        def get_video_stream():
+            """Stream only new frames; slow clients automatically skip old frames."""
+            def frames():
+                last_frame_at = 0.0
+                while not stop_event.is_set():
+                    with self._frame_condition:
+                        self._frame_condition.wait_for(
+                            lambda: self.latest_frame_at > last_frame_at
+                            or stop_event.is_set(),
+                            timeout=2.0,
+                        )
+                        if stop_event.is_set():
+                            break
+                        if self.latest_frame_at <= last_frame_at:
+                            continue
+                        jpeg = self.latest_frame_jpeg
+                        last_frame_at = self.latest_frame_at
+                    if jpeg:
+                        yield (
+                            b"--frame\r\nContent-Type: image/jpeg\r\n"
+                            + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+                            + jpeg
+                            + b"\r\n"
+                        )
+
+            return StreamingResponse(
+                frames(),
+                media_type="multipart/x-mixed-replace; boundary=frame",
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+            )
 
         # API endpoint: Get status
         @self.settings_app.get("/api/status")
@@ -491,7 +554,7 @@ class JudgyReachyNoPhone(ReachyMiniApp):
             else:
                 status_text = "✅ Phone-free"
 
-            mode_text = f"YOLO26m | {'LLM + TTS' if self.llm.client else 'Pre-written lines'} → {'ElevenLabs' if self.tts.eleven_client else 'Edge TTS'}"
+            mode_text = "YOLO26m + MediaPipe → OmniVoice (local)"
 
             # Determine button text
             if self.is_monitoring:
@@ -582,6 +645,15 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         @self.settings_app.post("/api/validate-keys")
         def validate_keys(req: ToggleRequest):
             """Test API keys and voice IDs without starting monitoring."""
+            return {
+                "groq_valid": False,
+                "eleven_valid": False,
+                "eleven_voice_valid": False,
+                "edge_voice_valid": False,
+                "mode": "YOLO26m + MediaPipe → OmniVoice (local)",
+                "errors": [],
+            }
+
             result = {
                 "groq_valid": False,
                 "eleven_valid": False,
@@ -788,10 +860,6 @@ class JudgyReachyNoPhone(ReachyMiniApp):
 
             return {"success": True, "message": f"Updated to {req.personality}"}
 
-        # Keep thread alive
-        while not stop_event.is_set():
-            time.sleep(1)
-
     def _format_duration(self, seconds: float) -> str:
         """Format duration in human-readable format."""
         if seconds < 60:
@@ -810,6 +878,6 @@ if __name__ == "__main__":
 
     app = JudgyReachyNoPhone()
     try:
-        app.wrapped_run()
+        app.wrapped_run(host=os.getenv("REACHY_MINI_HOST", "reachy-mini.local"))
     except KeyboardInterrupt:
         app.stop()

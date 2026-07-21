@@ -212,29 +212,36 @@ settingsModal.addEventListener('click', (e) => {
     }
 });
 
-// Update video feed
-async function updateVideo() {
-    try {
-        const response = await fetch('/api/video-frame');
-        const data = await response.json();
+// Use one long-lived MJPEG request. This avoids overlapping base64/JSON polls on Wi-Fi.
+function startVideoStream() {
+    const videoFeed = document.getElementById('video-feed');
+    const placeholder = document.getElementById('video-placeholder');
+    const standbyBadge = document.querySelector('.standby-badge');
+    let reconnectTimer = null;
 
-        const videoFeed = document.getElementById('video-feed');
-        const placeholder = document.getElementById('video-placeholder');
-        const standbyBadge = document.querySelector('.standby-badge');
+    const connect = () => {
+        videoFeed.src = `/api/video-stream?t=${Date.now()}`;
+    };
 
-        if (data.frame) {
-            videoFeed.src = 'data:image/jpeg;base64,' + data.frame;
-            videoFeed.classList.add('active');
-            placeholder.classList.add('hidden');
-            standbyBadge.style.display = 'none';
-        } else {
-            videoFeed.classList.remove('active');
-            placeholder.classList.remove('hidden');
-            standbyBadge.style.display = 'flex';
+    videoFeed.addEventListener('load', () => {
+        videoFeed.classList.add('active');
+        placeholder.classList.add('hidden');
+        standbyBadge.style.display = 'none';
+    });
+
+    videoFeed.addEventListener('error', () => {
+        videoFeed.classList.remove('active');
+        placeholder.classList.remove('hidden');
+        standbyBadge.style.display = 'flex';
+        if (!reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connect();
+            }, 1000);
         }
-    } catch (e) {
-        console.error('Video update failed:', e);
-    }
+    });
+
+    connect();
 }
 
 // Update display from API data
@@ -510,18 +517,15 @@ async function initialize() {
 
     // Initial UI update
     updateDisplay();
-    updateVideo();
+    startVideoStream();
     updateUIForAPIKeys();
 
     // Start loading status check (poll every 500ms until ready)
     checkLoadingStatus();  // Check immediately
     loadingCheckInterval = setInterval(checkLoadingStatus, 500);
 
-    // Auto-update every 100ms for smooth video
-    setInterval(() => {
-        updateVideo();
-        updateDisplay();
-    }, 100);
+    // Stats do not need video-rate polling; keep API traffic light on Wi-Fi.
+    setInterval(updateDisplay, 500);
 }
 
 // Start initialization when DOM is ready

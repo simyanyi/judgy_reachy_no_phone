@@ -1,6 +1,7 @@
 """Configuration and constants for Judgy Reachy No Phone app."""
 
 import random
+import os
 from dataclasses import dataclass
 
 
@@ -13,13 +14,13 @@ class Config:
     DETECTION_CONFIDENCE: float = 0.3  # Higher = fewer false positives
     COOLDOWN_SECONDS: float = 10.0     # Min time between shames
 
-    # API Keys (optional - leave empty for free defaults)
-    GROQ_API_KEY: str = ""             # Get free at console.groq.com
-    ELEVENLABS_API_KEY: str = ""       # Get free at elevenlabs.io
+    # Local-only features
+    FACE_TRACKING_ENABLED: bool = os.getenv("FACE_TRACKING_ENABLED", "true").lower() == "true"
+    FACE_TRACKING_CONFIDENCE: float = float(os.getenv("FACE_TRACKING_CONFIDENCE", "0.6"))
 
-    # TTS settings
-    EDGE_TTS_VOICE: str = "en-US-AnaNeural"  # Free voice
-    ELEVENLABS_VOICE_ID: str = "Iz2kaKkJmFf0yaZAMDTV"  # "Juliet"
+    # Kept for UI compatibility. Cloud keys are intentionally ignored.
+    GROQ_API_KEY: str = ""
+    ELEVENLABS_API_KEY: str = ""
 
 
 # Personality definitions for LLM
