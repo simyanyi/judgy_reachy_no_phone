@@ -1,7 +1,35 @@
-# Judgy Reachy — DGX Spark deployment
+# Judgy Reachy — macOS and DGX Spark
 
-The DGX Spark runs every model locally: YOLO26m phone detection, MediaPipe face
-tracking, and OmniVoice TTS. Reachy Mini only runs its onboard hardware daemon.
+## Setup on macOS
+
+The macOS installation uses the GStreamer wheel bundle, so Homebrew GStreamer
+is not required:
+
+```bash
+cd /path/to/judgy_reachy_no_phone
+./bootstrap_local.sh
+cp .env.example .env  # only if .env does not already exist
+```
+
+Start Reachy Mini Control and wake the robot. Set the robot IP and a UI port
+that does not conflict with Control in `.env`:
+
+```dotenv
+REACHY_MINI_HOST=<current-robot-ip-or-hostname>
+JUDGY_APP_PORT=8043
+```
+
+Then run:
+
+```bash
+./run_local.sh
+```
+
+Open `http://localhost:8043`. The Control app may remain open on port 8042;
+this app connects directly to the robot daemon at `REACHY_MINI_HOST`.
+
+The DGX Spark runs every model locally: YOLO26m phone detection, YOLO face
+tracking, and Kokoro-82M TTS. Reachy Mini only runs its onboard hardware daemon.
 The Reachy Mini Control app is not needed.
 
 ## Setup on DGX Spark (Ubuntu/Linux ARM64)
@@ -22,36 +50,43 @@ cp .env.example .env
 
 ## Configure local voice
 
-Copy a 5–15 second WAV of a voice you recorded or are permitted to clone to:
+Kokoro uses its packaged voices rather than a reference recording. The default
+American English voice is configured in `.env`:
 
-```text
-judgy_reachy_no_phone/assets/voice_reference.wav
+```dotenv
+KOKORO_PRELOAD=true
+KOKORO_MODEL_ID=hexgrad/Kokoro-82M
+KOKORO_LANGUAGE=a
+KOKORO_VOICE=af_heart
+KOKORO_SPEED=1.0
+HF_HOME=.cache/huggingface
 ```
 
-Edit `.env` and set `OMNIVOICE_REFERENCE_TEXT` to the exact words spoken in the
-sample. OmniVoice downloads its model once, then performs all TTS inference on
-the DGX. Set `OMNIVOICE_MODEL_PATH` to the downloaded local folder for fully
-offline restarts. YOLO likewise downloads `yolo26m.pt` once on its first run;
-keep that file beside the app for offline restarts.
+The model and selected voice download and warm up in the background when the app
+starts. The camera and web UI remain available during the first download; speech
+triggered before it finishes waits for the same preload. Later launches use the
+project-local `.cache/huggingface` directory and run locally. YOLO likewise downloads `yolo26m.pt` once on
+its first run; keep that file beside the app for offline restarts.
 
-## Start Reachy without the controller app
+## Run on DGX without the controller app
 
-From the DGX, ensure the robot is reachable and start its daemon:
+Set the robot address in `.env`. Port 8042 is available on DGX:
 
-```bash
-./wake_reachy.sh
+```dotenv
+REACHY_MINI_HOST=<current-robot-ip-or-hostname>
+JUDGY_APP_PORT=8042
 ```
 
-This uses `pollen@192.168.50.200` by default; change `REACHY_MINI_HOST` in
-`.env` if needed. The daemon is enabled at robot boot and wakes the robot using
-its service defaults.
-
-## Run the app
+Then use the combined launcher:
 
 ```bash
 source .venv/bin/activate
-./run_local.sh
+./run_dgx.sh
 ```
+
+It connects to `pollen@REACHY_MINI_HOST`, enables and starts
+`reachy-mini-daemon`, waits up to 30 seconds for port 8000, and launches the
+same application through `run_local.sh`.
 
 Open `http://127.0.0.1:8042` on the DGX, or `http://<DGX-IP>:8042` from another
 machine on the same network.
@@ -59,6 +94,6 @@ machine on the same network.
 ## Local components
 
 - YOLO26m + ByteTrack: phone detection and tracking
-- MediaPipe: face detection and Reachy head following
-- OmniVoice: local, voice-cloned WAV generation
+- YOLOv11n-face: isolated face detection and calibrated head following
+- Kokoro-82M: lightweight local WAV speech generation
 - Pre-written personality lines: no cloud LLM

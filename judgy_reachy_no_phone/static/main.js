@@ -1,5 +1,5 @@
 // State
-let selectedPersonality = 'pure_reachy';
+let selectedPersonality = null;
 let currentVoicePersonality = null;
 let voiceOverrides = JSON.parse(localStorage.getItem('voiceOverrides') || '{}');
 
@@ -11,6 +11,7 @@ async function loadPersonalities() {
     try {
         const response = await fetch('/api/personalities');
         const data = await response.json();
+        selectedPersonality = data.default_personality;
 
         const personalityList = document.getElementById('personality-list');
         personalityList.innerHTML = '';
@@ -22,7 +23,7 @@ async function loadPersonalities() {
             const name = nameMatch ? nameMatch[2] : personality.name;
 
             const card = document.createElement('div');
-            card.className = 'personality-card' + (personality.id === 'pure_reachy' ? ' active' : '');
+            card.className = 'personality-card' + (personality.id === selectedPersonality ? ' active' : '');
             card.dataset.personality = personality.id;
 
             card.innerHTML = `
@@ -223,10 +224,14 @@ function startVideoStream() {
         videoFeed.src = `/api/video-stream?t=${Date.now()}`;
     };
 
-    videoFeed.addEventListener('load', () => {
+    const showVideo = () => {
         videoFeed.classList.add('active');
         placeholder.classList.add('hidden');
         standbyBadge.style.display = 'none';
+    };
+
+    videoFeed.addEventListener('load', () => {
+        showVideo();
     });
 
     videoFeed.addEventListener('error', () => {
@@ -452,21 +457,27 @@ async function checkLoadingStatus() {
 
         const cameraStatus = document.getElementById('camera-status');
         const cameraMessage = document.getElementById('camera-message');
+        const videoFeed = document.getElementById('video-feed');
+        const placeholder = document.getElementById('video-placeholder');
+        const standbyBadge = document.querySelector('.standby-badge');
 
-        // Update loader overlay
-        if (data.model_status === 'loading') {
-            showLoader(data.model_message);
+        // Camera readiness is based on the backend's first decoded frame. Do
+        // not wait for the MJPEG <img> load event: a live response may never
+        // fire it in some browsers.
+        if (data.camera_status === 'ready') {
+            videoFeed.classList.add('active');
+            placeholder.classList.add('hidden');
+            standbyBadge.style.display = 'none';
+            hideLoader();
         } else if (data.camera_status === 'connecting') {
             showLoader(data.camera_message);
-        } else if (data.overall_ready) {
-            hideLoader();
-            // Stop polling once everything is ready
-            if (loadingCheckInterval) {
-                clearInterval(loadingCheckInterval);
-                loadingCheckInterval = null;
-            }
         } else if (data.model_status === 'error' || data.camera_status === 'error') {
             hideLoader();
+        } else if (data.model_status === 'loading') {
+            showLoader(data.model_message);
+        }
+
+        if (data.overall_ready || data.model_status === 'error' || data.camera_status === 'error') {
             if (loadingCheckInterval) {
                 clearInterval(loadingCheckInterval);
                 loadingCheckInterval = null;

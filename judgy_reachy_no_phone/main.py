@@ -27,7 +27,7 @@ from reachy_mini import ReachyMini, ReachyMiniApp
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 
-from .config import Config, PERSONALITIES
+from .config import Config, PERSONALITIES, get_random_personality
 from .detection import PhoneDetector
 from .audio import LLMResponder, TextToSpeech
 from .face_tracking import FaceTracker
@@ -43,17 +43,41 @@ from reachy_mini.motion.recorded_move import RecordedMoves
 logger = logging.getLogger(__name__)
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+APP_PORT = int(os.getenv("JUDGY_APP_PORT", "8042"))
+ROBOT_HOST = os.getenv("REACHY_MINI_HOST", "").strip()
+if not ROBOT_HOST:
+    raise RuntimeError("REACHY_MINI_HOST is missing from .env")
+
+configured_personality = os.getenv("DEFAULT_PERSONALITY", "random").strip().lower()
+if configured_personality in {"", "random"}:
+    DEFAULT_PERSONALITY = get_random_personality()
+elif configured_personality in PERSONALITIES:
+    DEFAULT_PERSONALITY = configured_personality
+else:
+    raise RuntimeError(
+        f"Invalid DEFAULT_PERSONALITY={configured_personality!r}. "
+        f"Valid values: random, {', '.join(PERSONALITIES)}"
+    )
+logger.info("Default personality selected: %s", DEFAULT_PERSONALITY)
 
 
 class JudgyReachyNoPhone(ReachyMiniApp):
     """Judgy Reachy No Phone - Get off your phone! 📱🤖"""
 
-    custom_app_url: str | None = "http://0.0.0.0:8042"
+    custom_app_url: str | None = f"http://0.0.0.0:{APP_PORT}"
     dont_start_webserver: bool = False
     request_media_backend: str | None = "default"
 
     def __init__(self):
         super().__init__()
+        configured_host = ROBOT_HOST.lower()
+        if configured_host and configured_host not in {
+            "localhost", "127.0.0.1", "::1",
+        }:
+            # ReachyMiniApp otherwise ignores the explicit host whenever any
+            # process happens to answer on the Mac's localhost:8000.
+            self.daemon_on_localhost = False
+            logger.info("Using explicitly configured remote daemon: %s", configured_host)
         self.config = Config()
 
         # Loading state tracking (like demo.js)
@@ -61,16 +85,15 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         self.model_loading_message = ""
         self.camera_loading_status = "idle"  # idle, connecting, ready, error
         self.camera_loading_message = "Waiting for camera connection..."
-
-        # Components (pass loading callback to detector)
+        self.tts_loading_status = "idle"  # idle, loading, ready, error, disabled
+        self.tts_loading_message = "Waiting to preload Kokoro..."
         self.detector = PhoneDetector(
             confidence=self.config.DETECTION_CONFIDENCE,
             loading_callback=self._on_model_loading
         )
-        self.llm = LLMResponder(api_key=self.config.GROQ_API_KEY, personality="pure_reachy")
-        # Don't pass config voice defaults - let personalities use their own defaults
+        self.llm = LLMResponder(api_key=self.config.GROQ_API_KEY, personality=DEFAULT_PERSONALITY)
         self.tts = TextToSpeech(
-            personality="pure_reachy"
+            personality=DEFAULT_PERSONALITY
         )
         self.face_tracker = FaceTracker(
             enabled=self.config.FACE_TRACKING_ENABLED,
@@ -127,13 +150,32 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                     "default_voice": data.get("default_voice", ""),
                     "default_eleven_voice": default_eleven or "",
                 })
-            return {"personalities": personalities_list}
+            return {
+                "personalities": personalities_list,
+                "default_personality": DEFAULT_PERSONALITY,
+            }
 
     def _on_model_loading(self, status: str, message: str):
         """Callback for model loading progress (like demo.js)."""
         self.model_loading_status = status
         self.model_loading_message = message
         logger.info(f"Model loading: {status} - {message}")
+
+    def _preload_tts(self):
+        """Warm Kokoro in the background so the first reaction is immediate."""
+        self.tts_loading_status = "loading"
+        self.tts_loading_message = "Downloading/loading local Kokoro model..."
+        logger.info("Preloading local Kokoro-82M model in the background...")
+        try:
+            self.tts.preload()
+        except Exception as exc:
+            self.tts_loading_status = "error"
+            self.tts_loading_message = f"Kokoro preload failed: {exc}"
+            logger.exception("Kokoro preload failed")
+        else:
+            self.tts_loading_status = "ready"
+            self.tts_loading_message = "Kokoro ready"
+            logger.info("Local Kokoro-82M model is ready")
 
     def _camera_thread(self, webcam, stop_event: threading.Event):
         """Fast camera capture and encoding thread (for laptop webcam in simulation)."""
@@ -156,9 +198,9 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                     fps_counter = 0
                     fps_start = time.time()
 
-                self.face_tracker.process(frame)
-                # Draw local phone and face detections for the web display.
-                frame_with_boxes = self.detector.draw_detections(frame)
+                # Camera frames may be read-only views. Draw only on a writable
+                # display copy and retain the original for inference.
+                frame_with_boxes = self.detector.draw_detections(frame.copy())
                 frame_with_boxes = self.face_tracker.draw(frame_with_boxes)
                 self._publish_frame(frame, frame_with_boxes)
 
@@ -194,9 +236,9 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                     fps_counter = 0
                     fps_start = time.time()
 
-                self.face_tracker.process(frame)
-                # Draw local phone and face detections for the web display.
-                frame_with_boxes = self.detector.draw_detections(frame)
+                # WebRTC supplies a read-only NumPy view on some backends.
+                # OpenCV drawing requires its own writable array.
+                frame_with_boxes = self.detector.draw_detections(frame.copy())
                 frame_with_boxes = self.face_tracker.draw(frame_with_boxes)
                 self._publish_frame(frame, frame_with_boxes)
 
@@ -205,8 +247,22 @@ class JudgyReachyNoPhone(ReachyMiniApp):
 
     def _publish_frame(self, frame, display_frame):
         """Publish the newest frame without letting slow clients block capture."""
+        # Keep inference on the original frame, but avoid encoding and sending a
+        # needlessly large browser preview over Wi-Fi.
+        try:
+            preview_width = max(320, int(os.getenv("CAMERA_PREVIEW_WIDTH", "960")))
+            jpeg_quality = max(40, min(95, int(os.getenv("CAMERA_JPEG_QUALITY", "70"))))
+        except ValueError:
+            preview_width, jpeg_quality = 960, 70
+        height, width = display_frame.shape[:2]
+        if width > preview_width:
+            display_frame = cv2.resize(
+                display_frame,
+                (preview_width, round(height * preview_width / width)),
+                interpolation=cv2.INTER_AREA,
+            )
         encoded, buffer = cv2.imencode(
-            ".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
+            ".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
         )
         if not encoded:
             return
@@ -246,11 +302,28 @@ class JudgyReachyNoPhone(ReachyMiniApp):
             except Exception as exc:
                 logger.error("Detection error: %s", exc)
 
+    def _face_tracking_thread(self, stop_event: threading.Event):
+        """Track faces from the newest frame without delaying camera capture."""
+        last_frame_at = 0.0
+        while not stop_event.is_set() and self.camera_running:
+            with self._frame_condition:
+                self._frame_condition.wait_for(
+                    lambda: self.latest_frame_at > last_frame_at
+                    or stop_event.is_set(),
+                    timeout=0.5,
+                )
+                if stop_event.is_set() or self.latest_frame is None:
+                    continue
+                frame = self.latest_frame.copy()
+                last_frame_at = self.latest_frame_at
+            self.face_tracker.process(frame)
+
     def run(self, reachy_mini: ReachyMini, stop_event: threading.Event):
         """Main loop."""
 
         # Register all routes before lengthy model/camera initialization begins.
         self._run_ui(reachy_mini, stop_event)
+        logger.info("App ready: open http://localhost:%s", APP_PORT)
 
         # Model loading/downloads can take minutes on first run. Keep camera startup
         # independent so users get live video immediately.
@@ -261,6 +334,17 @@ class JudgyReachyNoPhone(ReachyMiniApp):
             daemon=True,
         )
         model_thread.start()
+
+        preload_tts = os.getenv("KOKORO_PRELOAD", "true").strip().lower()
+        if preload_tts in {"1", "true", "yes", "on"}:
+            threading.Thread(
+                target=self._preload_tts,
+                name="kokoro-loader",
+                daemon=True,
+            ).start()
+        else:
+            self.tts_loading_status = "disabled"
+            self.tts_loading_message = "Kokoro startup preload disabled"
 
         # Auto-detect: Use laptop webcam in simulation, robot camera otherwise
         is_simulation = reachy_mini.client.get_status().simulation_enabled
@@ -305,6 +389,14 @@ class JudgyReachyNoPhone(ReachyMiniApp):
             camera_thread.start()
 
         if self.camera_running:
+            face_tracking_thread = threading.Thread(
+                target=self._face_tracking_thread,
+                args=(stop_event,),
+                name="face-tracking",
+                daemon=True,
+            )
+            face_tracking_thread.start()
+
             detection_thread = threading.Thread(
                 target=self._detection_thread,
                 args=(stop_event,),
@@ -354,6 +446,7 @@ class JudgyReachyNoPhone(ReachyMiniApp):
         finally:
             # Stop camera thread
             self.camera_running = False
+            self.face_tracker.close()
             if webcam is not None:
                 webcam.release()
                 logger.info("Webcam released")
@@ -462,7 +555,7 @@ class JudgyReachyNoPhone(ReachyMiniApp):
             cooldown: int = 30
             praise: bool = True
             reset: bool = False  # If True, reset all stats (Start Fresh)
-            personality: str = "pure_reachy"  # Robot personality
+            personality: str = DEFAULT_PERSONALITY  # Robot personality
 
         # API endpoint: Get loading status (like demo.js)
         @self.settings_app.get("/api/loading-status")
@@ -481,6 +574,8 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                 "model_message": self.model_loading_message,
                 "camera_status": camera_status,
                 "camera_message": camera_message,
+                "tts_status": self.tts_loading_status,
+                "tts_message": self.tts_loading_message,
                 "overall_ready": (
                     self.model_loading_status == "ready" and
                     camera_status == "ready"
@@ -554,7 +649,7 @@ class JudgyReachyNoPhone(ReachyMiniApp):
             else:
                 status_text = "✅ Phone-free"
 
-            mode_text = "YOLO26m + MediaPipe → OmniVoice (local)"
+            mode_text = "YOLO phone + YOLO face → Kokoro-82M (local)"
 
             # Determine button text
             if self.is_monitoring:
@@ -650,7 +745,7 @@ class JudgyReachyNoPhone(ReachyMiniApp):
                 "eleven_valid": False,
                 "eleven_voice_valid": False,
                 "edge_voice_valid": False,
-                "mode": "YOLO26m + MediaPipe → OmniVoice (local)",
+                "mode": "YOLO phone + YOLO face → Kokoro-82M (local)",
                 "errors": [],
             }
 
@@ -878,6 +973,6 @@ if __name__ == "__main__":
 
     app = JudgyReachyNoPhone()
     try:
-        app.wrapped_run(host=os.getenv("REACHY_MINI_HOST", "reachy-mini.local"))
+        app.wrapped_run(host=ROBOT_HOST)
     except KeyboardInterrupt:
         app.stop()

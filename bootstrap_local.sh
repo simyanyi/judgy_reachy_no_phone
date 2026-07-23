@@ -12,4 +12,4 @@ if [ ! -f .env ]; then
   cp .env.example .env
 fi
 
-printf '\nSetup complete. Add your permitted voice sample at judgy_reachy_no_phone/assets/voice_reference.wav, then edit .env.\n'
+printf '\nSetup complete. Set the Reachy host in .env, then run ./run_local.sh.\n'
