@@ -53,15 +53,6 @@ cp .env.example .env
 Kokoro uses its packaged voices rather than a reference recording. The default
 American English voice is configured in `.env`:
 
-```dotenv
-KOKORO_PRELOAD=true
-KOKORO_MODEL_ID=hexgrad/Kokoro-82M
-KOKORO_LANGUAGE=a
-KOKORO_VOICE=af_heart
-KOKORO_SPEED=1.0
-HF_HOME=.cache/huggingface
-```
-
 The model and selected voice download and warm up in the background when the app
 starts. The camera and web UI remain available during the first download; speech
 triggered before it finishes waits for the same preload. Later launches use the
